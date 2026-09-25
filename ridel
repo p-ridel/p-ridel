@@ -1,0 +1,2400 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# Plataforma Ridel — CLI de Desenvolvimento e Gestão de Serviços
+# ==============================================================================
+
+# Resolver diretório raiz do projeto mesmo se executado via symlink
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+PROJECT_ROOT="$(cd -P "$(dirname "$SOURCE")" >/dev/null 2>&1 && pwd)"
+
+# Diretórios de runtime (PIDs e Logs)
+RUN_DIR="$PROJECT_ROOT/.ridel"
+PID_DIR="${PID_DIR:-$RUN_DIR/pids}"
+LOG_DIR="${LOG_DIR:-$RUN_DIR/logs}"
+
+mkdir -p "$PID_DIR" "$LOG_DIR"
+
+# Estilos e Cores ANSI
+BOLD='\033[1m'
+DIM='\033[2m'
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+NC='\033[0m' # No Color
+
+# Helper de logs no terminal
+info()    { echo -e "${CYAN}ℹ${NC} $1"; }
+success() { echo -e "${GREEN}✔${NC} $1"; }
+warn()    { echo -e "${YELLOW}▲${NC} $1"; }
+error()   { echo -e "${RED}✖${NC} $1"; }
+
+# ------------------------------------------------------------------------------
+# Funções Utilitárias de Processo e Rede
+# ------------------------------------------------------------------------------
+
+is_pid_alive() {
+  local pid="$1"
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+find_pid_by_port() {
+  local port="$1"
+  lsof -iTCP:"$port" -sTCP:LISTEN -t 2>/dev/null | head -n 1
+}
+
+kill_process() {
+  local name="$1"
+  local pid="$2"
+
+  if is_pid_alive "$pid"; then
+    echo -n "Encerrando $name (PID: $pid)... "
+    kill -TERM "$pid" 2>/dev/null || true
+    
+    # Aguarda até 5 segundos para finalização graciosa
+    local count=0
+    while is_pid_alive "$pid" && [ $count -lt 10 ]; do
+      sleep 0.5
+      count=$((count + 1))
+    done
+
+    # Força finalização se ainda estiver ativo
+    if is_pid_alive "$pid"; then
+      kill -KILL "$pid" 2>/dev/null || true
+      echo -e "${YELLOW}(forçado)${NC}"
+    else
+      echo -e "${GREEN}(sucesso)${NC}"
+    fi
+  fi
+}
+
+is_container_env() {
+  [ -f /.dockerenv ] || [ -f /run/.containerenv ]
+}
+
+is_standalone_host() {
+  if is_container_env; then
+    return 1
+  fi
+  [ ! -d "$PROJECT_ROOT/backend" ]
+}
+
+standalone_container_running() {
+  local container_name="${1:-ridel}"
+  docker ps --format '{{.Names}}' 2>/dev/null | grep -wq "^${container_name}$"
+}
+
+standalone_proxy() {
+  local container_name="ridel"
+  if ! standalone_container_running "$container_name"; then
+    error "O contêiner '$container_name' não está em execução."
+    info "Inicie a plataforma no host com: ridel start"
+    return 1
+  fi
+
+  if [ -t 0 ] && [ -t 1 ]; then
+    docker exec -it "$container_name" ridel "$@"
+  else
+    docker exec "$container_name" ridel "$@"
+  fi
+}
+
+standalone_start() {
+  local container_name="ridel"
+  if standalone_container_running "$container_name"; then
+    info "O contêiner '$container_name' já está em execução."
+    return 0
+  fi
+
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -wq "^${container_name}$"; then
+    info "Iniciando contêiner '$container_name' existente..."
+    docker start "$container_name"
+    success "Contêiner '$container_name' iniciado com sucesso."
+  else
+    info "Iniciando contêiner oficial '$container_name' da Plataforma Ridel..."
+    mkdir -p "$HOME/ridel-data"
+    docker run -d \
+      --name "$container_name" \
+      --restart unless-stopped \
+      -p 8000:8000 \
+      -p 5432:5432 \
+      -v "$HOME/ridel-data:/data" \
+      ghcr.io/p-ridel/p-ridel:latest
+    success "Contêiner '$container_name' criado e iniciado."
+  fi
+}
+
+standalone_stop() {
+  local container_name="ridel"
+  info "Parando contêiner '$container_name'..."
+  docker stop "$container_name"
+  success "Contêiner '$container_name' parado com sucesso."
+}
+
+standalone_restart() {
+  local container_name="ridel"
+  info "Reiniciando contêiner '$container_name'..."
+  docker restart "$container_name"
+  success "Contêiner '$container_name' reiniciado com sucesso."
+}
+
+standalone_logs() {
+  local container_name="ridel"
+  docker logs -f "$container_name"
+}
+
+standalone_status() {
+  local container_name="ridel"
+  info "Status da Plataforma Ridel (Modo Host):"
+  if standalone_container_running "$container_name"; then
+    success "Contêiner '$container_name': EM EXECUÇÃO"
+    docker ps --filter "name=^${container_name}$" --format "ID: {{.ID}} | Imagem: {{.Image}} | Status: {{.Status}} | Portas: {{.Ports}}"
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8000/health" 2>/dev/null || echo "000")
+    if [ "$http_code" = "200" ]; then
+      success "Engine FastAPI / Universal Player: OK (http://localhost:8000)"
+    else
+      warn "Engine FastAPI: aguardando inicialização (HTTP $http_code)"
+    fi
+  else
+    warn "Contêiner '$container_name': PARADO"
+    info "Execute 'ridel start' para subir o contêiner."
+  fi
+}
+
+cli_self_update() {
+  info "Verificando atualizações da CLI 'ridel' no GitHub..."
+  local target_path
+  target_path="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+
+  local raw_url="${RIDEL_RAW_URL:-https://raw.githubusercontent.com/p-ridel/p-ridel/main/ridel}"
+  local tmp_file
+  tmp_file="$(mktemp)"
+
+  if curl -fsSL "$raw_url" -o "$tmp_file"; then
+    chmod +x "$tmp_file"
+    mv "$tmp_file" "$target_path"
+    success "CLI 'ridel' atualizada com sucesso!"
+  else
+    rm -f "$tmp_file"
+    error "Falha ao baixar atualização da CLI de $raw_url."
+    return 1
+  fi
+}
+
+tenant_create() {
+  local name="$1"
+  shift || true
+  local title=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --title)
+        title="$2"
+        shift 2
+        ;;
+      *)
+        shift
+        ;;
+    esac
+  done
+
+  if [[ -z "$name" ]]; then
+    error "Informe o nome do tenant. Uso: ridel tenant create <nome> [--title 'Título']"
+    return 1
+  fi
+
+  if [[ -z "$title" ]]; then
+    title="$name"
+  fi
+
+  local base_dir=""
+  if is_container_env; then
+    base_dir="/data/tenants/$name"
+  else
+    base_dir="$PROJECT_ROOT/backend/tenants/$name"
+  fi
+
+  if [[ -d "$base_dir" ]]; then
+    warn "O tenant '$name' já existe em $base_dir."
+    return 0
+  fi
+
+  info "Criando estrutura do tenant '$name' em $base_dir..."
+  mkdir -p "$base_dir/apps"
+
+  cat << 'EOF' > "$base_dir/app.py"
+"""Tenant application metadata and facade."""
+from .tables import *
+from .views import views
+
+__all__ = ["views"]
+EOF
+
+  cat << 'EOF' > "$base_dir/tables.py"
+"""Declarative data models and tables."""
+from engine.fields import IntegerField, StringField, DateTimeField
+from engine.table import Table
+
+class ItemTable(Table):
+    id = IntegerField(primary_key=True)
+    name = StringField(label="Nome", required=True)
+    created_at = DateTimeField(label="Criado em", auto_now_add=True)
+EOF
+
+  cat << 'EOF' > "$base_dir/views.py"
+"""Declarative views and UI layout."""
+from engine.views import TableView, FormView
+
+views = [
+    TableView(name="items_list", table="ItemTable", label="Itens", position="primary"),
+    FormView(name="item_form", table="ItemTable", label="Formulário do Item", position="ref"),
+]
+EOF
+
+  cat << 'EOF' > "$base_dir/roles.py"
+"""Role-based access control (RBAC)."""
+roles = {
+    "admin": {"ItemTable": ["read", "write", "delete"]},
+    "user": {"ItemTable": ["read"]},
+}
+EOF
+
+  cat << 'EOF' > "$base_dir/actions.py"
+"""Custom business actions."""
+EOF
+
+  cat << 'EOF' > "$base_dir/user.py"
+"""Declarative users."""
+users = [
+    {"username": f"admin@{name}.com", "password": "admin123", "role": "admin"}
+]
+EOF
+
+  success "Tenant '$name' ($title) criado com sucesso em: $base_dir"
+  info "Você já pode editar as tabelas em $base_dir/tables.py e views em $base_dir/views.py."
+}
+
+# ------------------------------------------------------------------------------
+# 1. Banco de Dados (PostgreSQL via Docker / Supervisord)
+# ------------------------------------------------------------------------------
+
+db_start() {
+  if is_container_env; then
+    if command -v supervisorctl >/dev/null 2>&1; then
+      info "Ambiente Docker detectado: iniciando PostgreSQL via Supervisord..."
+      supervisorctl start postgresql
+      return $?
+    fi
+  fi
+  info "Iniciando container do PostgreSQL..."
+  docker compose -f "$PROJECT_ROOT/docker-compose.yml" up -d
+  if [ $? -eq 0 ]; then
+    success "PostgreSQL iniciado com sucesso via Docker Compose."
+  else
+    error "Falha ao iniciar o PostgreSQL."
+    return 1
+  fi
+}
+
+db_stop() {
+  if is_container_env; then
+    if command -v supervisorctl >/dev/null 2>&1; then
+      info "Ambiente Docker detectado: parando PostgreSQL via Supervisord..."
+      supervisorctl stop postgresql
+      return $?
+    fi
+  fi
+  info "Parando container do PostgreSQL..."
+  docker compose -f "$PROJECT_ROOT/docker-compose.yml" down
+  success "PostgreSQL finalizado."
+}
+
+db_restart() {
+  if is_container_env; then
+    if command -v supervisorctl >/dev/null 2>&1; then
+      info "Ambiente Docker detectado: reiniciando PostgreSQL via Supervisord..."
+      supervisorctl restart postgresql
+      return $?
+    fi
+  fi
+  info "Reiniciando PostgreSQL..."
+  docker compose -f "$PROJECT_ROOT/docker-compose.yml" restart
+  success "PostgreSQL reiniciado."
+}
+
+db_status() {
+  if is_container_env; then
+    if command -v supervisorctl >/dev/null 2>&1; then
+      local pg_stat
+      pg_stat=$(supervisorctl status postgresql 2>/dev/null)
+      if [[ "$pg_stat" == *"RUNNING"* ]]; then
+        success "PostgreSQL (Supervisord): $pg_stat"
+        return 0
+      else
+        warn "PostgreSQL (Supervisord): $pg_stat"
+        return 1
+      fi
+    fi
+  fi
+  local status_output
+  status_output=$(docker compose -f "$PROJECT_ROOT/docker-compose.yml" ps --format "{{.Name}}: {{.State}} ({{.Health}})" 2>/dev/null)
+  if [ -n "$status_output" ]; then
+    success "PostgreSQL: $status_output"
+    return 0
+  else
+    warn "PostgreSQL: Parado / Não encontrado."
+    return 1
+  fi
+}
+
+db_logs() {
+  local tenant=""
+  local days=""
+  local tail_lines="100"
+  local all_logs=false
+
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -t|--tenant)
+        tenant="$2"
+        shift 2
+        ;;
+      -d|--days)
+        days="$2"
+        shift 2
+        ;;
+      --today)
+        days="0"
+        shift
+        ;;
+      --tail|-n)
+        tail_lines="$2"
+        shift 2
+        ;;
+      --all)
+        all_logs=true
+        shift
+        ;;
+      -*)
+        warn "Opção desconhecida: $1"
+        shift
+        ;;
+      *)
+        if [ -z "$tenant" ]; then
+          tenant="$1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  local compose_args=("-f" "$PROJECT_ROOT/docker-compose.yml" "logs")
+
+  # Tratamento do filtro temporal (--since)
+  if [ -n "$days" ]; then
+    if [ "$days" -eq 0 ] 2>/dev/null; then
+      local today_start
+      today_start=$(date +%Y-%m-%dT00:00:00)
+      compose_args+=("--since" "$today_start")
+    elif [ "$days" -gt 0 ] 2>/dev/null; then
+      local hours=$((days * 24))
+      compose_args+=("--since" "${hours}h")
+    else
+      warn "Valor inválido para dias: '$days'. Ignorando filtro temporal."
+    fi
+  fi
+
+  # Tratamento do limite de linhas (padrão: 100 linhas a menos que --all seja informado)
+  if [ "$all_logs" = false ]; then
+    compose_args+=("--tail" "$tail_lines")
+  fi
+
+  compose_args+=("-f" "postgres")
+
+  if [ -n "$tenant" ]; then
+    info "Acompanhando logs em tempo real para o tenant '$tenant' (Ctrl+C para sair)..."
+    docker compose "${compose_args[@]}" | grep --line-buffered -iE "tenant[:_]$tenant|tenant_$tenant|\[$tenant\]|\b$tenant\b"
+  else
+    docker compose "${compose_args[@]}"
+  fi
+}
+
+db_seed() {
+  local tenant="demo"
+  local extra_args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -t|--tenant)
+        tenant="$2"
+        extra_args+=("-t" "$2")
+        shift 2
+        ;;
+      *)
+        extra_args+=("$1")
+        shift
+        ;;
+    esac
+  done
+
+  info "Executando seed para o tenant '$tenant' no banco de dados..."
+  local py_bin="$PROJECT_ROOT/backend/.venv/bin/python"
+  if is_container_env && [ -f "/opt/venv/bin/python" ]; then
+    py_bin="/opt/venv/bin/python"
+    if [ -f "/data/.env" ]; then
+      set -a
+      source /data/.env 2>/dev/null || true
+      set +a
+    elif [ -f "/etc/environment" ]; then
+      set -a
+      source /etc/environment 2>/dev/null || true
+      set +a
+    fi
+  elif [ ! -f "$py_bin" ]; then
+    error "Ambiente virtual Python não encontrado em backend/.venv. Execute a configuração antes."
+    return 1
+  fi
+  (cd "$PROJECT_ROOT/backend" && "$py_bin" scripts/seed.py "${extra_args[@]}")
+  success "Seed executado com sucesso."
+}
+
+# ------------------------------------------------------------------------------
+# 2. Backend (FastAPI / Uvicorn)
+# ------------------------------------------------------------------------------
+
+backend_start() {
+  if is_container_env; then
+    if command -v supervisorctl >/dev/null 2>&1; then
+      info "Ambiente Docker detectado: iniciando Backend via Supervisord..."
+      supervisorctl start ridel_backend
+      return $?
+    fi
+  fi
+  local foreground=false
+  for arg in "$@"; do
+    if [[ "$arg" == "-f" || "$arg" == "--foreground" ]]; then
+      foreground=true
+    fi
+  done
+
+  # Verificar se a porta 8000 já está em uso
+  local existing_pid
+  existing_pid=$(find_pid_by_port 8000)
+  if [ -n "$existing_pid" ]; then
+    warn "Backend já parece estar em execução na porta 8000 (PID: $existing_pid)."
+    return 0
+  fi
+
+  local uvicorn_bin="$PROJECT_ROOT/backend/.venv/bin/uvicorn"
+  if [ ! -f "$uvicorn_bin" ]; then
+    error "Uvicorn não encontrado em backend/.venv/bin/uvicorn. Crie o venv e instale as dependências."
+    return 1
+  fi
+
+  if [ "$foreground" = true ]; then
+    info "Iniciando Backend em primeiro plano na porta 8000 (Ctrl+C para encerrar)..."
+    cd "$PROJECT_ROOT/backend" && "$uvicorn_bin" ridel.api.main:app --reload --port 8000
+  else
+    info "Iniciando Backend em segundo plano na porta 8000..."
+    cd "$PROJECT_ROOT/backend"
+    setsid "$uvicorn_bin" ridel.api.main:app --reload --port 8000 < /dev/null > "$LOG_DIR/backend.log" 2>&1 &
+    local new_pid=$!
+    echo "$new_pid" > "$PID_DIR/backend.pid"
+
+    sleep 1.5
+    if is_pid_alive "$new_pid"; then
+      success "Backend rodando em background (PID: $new_pid) → http://localhost:8000"
+      info "Logs disponíveis em: .ridel/logs/backend.log (ou execute: ridel backend logs)"
+    else
+      error "Falha ao iniciar o Backend. Verifique o log com: ridel backend logs"
+      return 1
+    fi
+  fi
+}
+
+backend_stop() {
+  if is_container_env; then
+    if command -v supervisorctl >/dev/null 2>&1; then
+      info "Ambiente Docker detectado: parando Backend via Supervisord..."
+      supervisorctl stop ridel_backend
+      return $?
+    fi
+  fi
+  local pid=""
+  if [ -f "$PID_DIR/backend.pid" ]; then
+    pid=$(cat "$PID_DIR/backend.pid")
+  fi
+
+  local port_pid
+  port_pid=$(find_pid_by_port 8000)
+
+  if [ -n "$pid" ]; then
+    kill_process "Backend (FastAPI)" "$pid"
+    rm -f "$PID_DIR/backend.pid"
+  fi
+
+  if [ -n "$port_pid" ] && [ "$port_pid" != "$pid" ]; then
+    kill_process "Processo residual na porta 8000" "$port_pid"
+  fi
+
+  if [ -z "$pid" ] && [ -z "$port_pid" ]; then
+    info "Backend não está em execução."
+  fi
+}
+
+backend_restart() {
+  if is_container_env; then
+    if command -v supervisorctl >/dev/null 2>&1; then
+      info "Ambiente Docker detectado: reiniciando Backend via Supervisord..."
+      supervisorctl restart ridel_backend
+      return $?
+    fi
+  fi
+  info "Reiniciando Backend..."
+  backend_stop
+  sleep 1
+  backend_start "$@"
+}
+
+backend_status() {
+  if is_container_env; then
+    if command -v supervisorctl >/dev/null 2>&1; then
+      local be_stat
+      be_stat=$(supervisorctl status ridel_backend 2>/dev/null)
+      if [[ "$be_stat" == *"RUNNING"* ]]; then
+        success "Backend (Supervisord): $be_stat → http://localhost:8000"
+        return 0
+      else
+        warn "Backend (Supervisord): $be_stat"
+        return 1
+      fi
+    fi
+  fi
+  local port_pid
+  port_pid=$(find_pid_by_port 8000)
+
+  local pid=""
+  if [ -f "$PID_DIR/backend.pid" ]; then
+    pid=$(cat "$PID_DIR/backend.pid")
+  fi
+
+  if [ -n "$port_pid" ]; then
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 2 http://localhost:8000/docs 2>/dev/null || echo "000")
+    if [ "$http_code" == "200" ]; then
+      success "Backend: RODANDO (PID: $port_pid na porta 8000 - HTTP $http_code OK) → http://localhost:8000"
+    else
+      warn "Backend: INICIANDO / OCUPADO (PID: $port_pid na porta 8000 - HTTP $http_code)"
+    fi
+    return 0
+  elif is_pid_alive "$pid"; then
+    warn "Backend: INICIANDO (PID: $pid) → http://localhost:8000 (Acompanhe com: ridel backend logs)"
+    return 0
+  else
+    warn "Backend: PARADO"
+    return 1
+  fi
+}
+
+backend_logs() {
+  if [ ! -f "$LOG_DIR/backend.log" ]; then
+    warn "Arquivo de log não encontrado em $LOG_DIR/backend.log"
+    return 1
+  fi
+  tail -f "$LOG_DIR/backend.log"
+}
+
+# ------------------------------------------------------------------------------
+# 3. Frontend (Flutter Web)
+# ------------------------------------------------------------------------------
+
+find_flutter_bin() {
+  if [ -x "$HOME/snap/flutter/common/flutter/bin/flutter" ]; then
+    echo "$HOME/snap/flutter/common/flutter/bin/flutter"
+    return 0
+  fi
+  if command -v flutter >/dev/null 2>&1; then
+    command -v flutter
+    return 0
+  fi
+  return 1
+}
+
+frontend_start() {
+  if is_container_env; then
+    success "Ambiente Docker detectado: o Frontend Web já está pré-compilado e integrado ao Backend (porta 8000)."
+    return 0
+  fi
+  local foreground=false
+  local release=false
+  for arg in "$@"; do
+    if [[ "$arg" == "-f" || "$arg" == "--foreground" ]]; then
+      foreground=true
+    elif [[ "$arg" == "--release" ]]; then
+      release=true
+    fi
+  done
+
+  # Verificar se a porta 3000 já está em uso
+  local existing_pid
+  existing_pid=$(find_pid_by_port 3000)
+  if [ -n "$existing_pid" ]; then
+    warn "Frontend já parece estar ativo na porta 3000 (PID: $existing_pid)."
+    return 0
+  fi
+
+  local flutter_bin
+  flutter_bin=$(find_flutter_bin)
+  if [ -z "$flutter_bin" ]; then
+    error "SDK do Flutter não encontrado."
+    return 1
+  fi
+
+  local run_args=("-d" "web-server" "--web-port=3000")
+  if [ "$release" = true ]; then
+    run_args+=("--release")
+  fi
+
+  if [ "$foreground" = true ]; then
+    if [ "$release" = true ]; then
+      info "Iniciando Flutter Web em modo RELEASE em primeiro plano na porta 3000 (Ctrl+C para encerrar)..."
+    else
+      info "Iniciando Flutter Web em primeiro plano na porta 3000..."
+      info "Pressione 'r' para Hot Reload, 'R' para Hot Restart, 'q' para encerrar."
+    fi
+    cd "$PROJECT_ROOT/frontend" && "$flutter_bin" run "${run_args[@]}"
+  else
+    if [ "$release" = true ]; then
+      info "Iniciando Flutter Web em modo RELEASE em segundo plano na porta 3000..."
+      echo "1" > "$PID_DIR/frontend.release"
+      cd "$PROJECT_ROOT/frontend"
+      setsid "$flutter_bin" run "${run_args[@]}" < /dev/null > "$LOG_DIR/frontend.log" 2>&1 &
+      local new_pid=$!
+      echo "$new_pid" > "$PID_DIR/frontend.pid"
+    else
+      info "Iniciando Flutter Web em segundo plano na porta 3000..."
+      rm -f "$PID_DIR/frontend.release"
+
+      local fifo="$PID_DIR/frontend.pipe"
+      rm -f "$fifo"
+      mkfifo "$fifo"
+
+      # Mantém o pipe aberto para escrita em segundo plano (evita EOF no stdin do flutter)
+      tail -f /dev/null > "$fifo" &
+      local pipe_holder_pid=$!
+      echo "$pipe_holder_pid" > "$PID_DIR/frontend.pipe.pid"
+
+      cd "$PROJECT_ROOT/frontend"
+      setsid "$flutter_bin" run "${run_args[@]}" < "$fifo" > "$LOG_DIR/frontend.log" 2>&1 &
+      local new_pid=$!
+      echo "$new_pid" > "$PID_DIR/frontend.pid"
+    fi
+
+    sleep 2
+    if is_pid_alive "$new_pid"; then
+      if [ "$release" = true ]; then
+        success "Frontend (RELEASE) inicializando em background (PID: $new_pid) → http://localhost:3000"
+        info "A compilação em release pode levar alguns instantes. Acompanhe com: ridel frontend logs"
+      else
+        success "Frontend inicializando em background (PID: $new_pid) → http://localhost:3000"
+        info "Aguarde a compilação inicial. Acompanhe com: ridel frontend logs"
+      fi
+    else
+      error "Falha ao iniciar o Frontend. Verifique com: ridel frontend logs"
+      return 1
+    fi
+  fi
+}
+
+frontend_stop() {
+  local pid=""
+  if [ -f "$PID_DIR/frontend.pid" ]; then
+    pid=$(cat "$PID_DIR/frontend.pid")
+  fi
+
+  local port_pid
+  port_pid=$(find_pid_by_port 3000)
+
+  if [ -n "$pid" ]; then
+    kill_process "Frontend (Flutter Web)" "$pid"
+    rm -f "$PID_DIR/frontend.pid"
+  fi
+
+  if [ -n "$port_pid" ] && [ "$port_pid" != "$pid" ]; then
+    kill_process "Processo residual na porta 3000" "$port_pid"
+  fi
+
+  # Encerra processo mantenedor do pipe se existir
+  if [ -f "$PID_DIR/frontend.pipe.pid" ]; then
+    local pipe_pid
+    pipe_pid=$(cat "$PID_DIR/frontend.pipe.pid")
+    kill_process "Pipe Holder" "$pipe_pid"
+    rm -f "$PID_DIR/frontend.pipe.pid"
+  fi
+  rm -f "$PID_DIR/frontend.pipe"
+  rm -f "$PID_DIR/frontend.release"
+
+  # Garante encerramento de eventuais subprocessos Dart órfãos do flutter_tools
+  pkill -f "flutter_tools.snapshot.*--web-port=3000" 2>/dev/null || true
+  pkill -f "flutter.*--web-port=3000" 2>/dev/null || true
+
+  if [ -z "$pid" ] && [ -z "$port_pid" ]; then
+    info "Frontend não está em execução."
+  fi
+}
+
+frontend_restart() {
+  info "Reiniciando Frontend..."
+  frontend_stop
+  sleep 1
+  frontend_start "$@"
+}
+
+frontend_release() {
+  info "Alternando Frontend para modo RELEASE..."
+  frontend_stop
+  sleep 1
+  frontend_start --release "$@"
+}
+
+frontend_reload() {
+  local pid=""
+  if [ -f "$PID_DIR/frontend.pid" ]; then
+    pid=$(cat "$PID_DIR/frontend.pid")
+  fi
+
+  local port_pid
+  port_pid=$(find_pid_by_port 3000)
+
+  if (! is_pid_alive "$pid") && [ -z "$port_pid" ]; then
+    warn "Frontend não está em execução. Inicie o frontend com: ridel frontend start"
+    return 1
+  fi
+
+  local target_pid=""
+  if is_pid_alive "$pid"; then
+    target_pid="$pid"
+  elif [ -n "$port_pid" ]; then
+    target_pid="$port_pid"
+  fi
+
+  if [ -f "$PID_DIR/frontend.release" ] || ( [ -n "$target_pid" ] && grep -qa -- "--release" "/proc/$target_pid/cmdline" 2>/dev/null ); then
+    warn "O Flutter Web está em execução em modo RELEASE. O modo RELEASE não suporta Hot Reload/Hot Restart dinâmico."
+    info "Para utilizar Hot Reload, inicie o frontend em modo de desenvolvimento: ridel frontend start"
+    return 1
+  fi
+
+  local fifo="$PID_DIR/frontend.pipe"
+  if [ ! -p "$fifo" ]; then
+    warn "Canal de comunicação (pipe) do frontend não encontrado em $fifo."
+    info "Reinicie o frontend para habilitar o canal de reload: ridel frontend restart"
+    return 1
+  fi
+
+  info "Enviando sinal de Hot Reload ('r') para o Flutter Web..."
+  if timeout 2 bash -c "echo 'r' > '$fifo'" 2>/dev/null; then
+    success "Hot Reload disparado com sucesso no Universal Player!"
+    info "Acompanhe os logs em tempo real com: ridel frontend logs"
+    return 0
+  else
+    error "Falha ao enviar sinal para o pipe do Flutter Web."
+    return 1
+  fi
+}
+
+frontend_hot_restart() {
+  local pid=""
+  if [ -f "$PID_DIR/frontend.pid" ]; then
+    pid=$(cat "$PID_DIR/frontend.pid")
+  fi
+
+  local port_pid
+  port_pid=$(find_pid_by_port 3000)
+
+  if (! is_pid_alive "$pid") && [ -z "$port_pid" ]; then
+    warn "Frontend não está em execução. Inicie o frontend com: ridel frontend start"
+    return 1
+  fi
+
+  local target_pid=""
+  if is_pid_alive "$pid"; then
+    target_pid="$pid"
+  elif [ -n "$port_pid" ]; then
+    target_pid="$port_pid"
+  fi
+
+  if [ -f "$PID_DIR/frontend.release" ] || ( [ -n "$target_pid" ] && grep -qa -- "--release" "/proc/$target_pid/cmdline" 2>/dev/null ); then
+    warn "O Flutter Web está em execução em modo RELEASE. O modo RELEASE não suporta Hot Reload/Hot Restart dinâmico."
+    info "Para utilizar Hot Restart, inicie o frontend em modo de desenvolvimento: ridel frontend start"
+    return 1
+  fi
+
+  local fifo="$PID_DIR/frontend.pipe"
+  if [ ! -p "$fifo" ]; then
+    warn "Canal de comunicação (pipe) do frontend não encontrado em $fifo."
+    info "Reinicie o frontend para habilitar o canal de reload: ridel frontend restart"
+    return 1
+  fi
+
+  info "Enviando sinal de Hot Restart ('R') para o Flutter Web..."
+  if timeout 2 bash -c "echo 'R' > '$fifo'" 2>/dev/null; then
+    success "Hot Restart disparado com sucesso no Universal Player!"
+    info "Acompanhe os logs em tempo real com: ridel frontend logs"
+    return 0
+  else
+    error "Falha ao enviar sinal para o pipe do Flutter Web."
+    return 1
+  fi
+}
+
+frontend_status() {
+  if is_container_env; then
+    success "Frontend: INTEGRADO ao Backend (servido na porta 8000)"
+    return 0
+  fi
+  local port_pid
+  port_pid=$(find_pid_by_port 3000)
+
+  local pid=""
+  if [ -f "$PID_DIR/frontend.pid" ]; then
+    pid=$(cat "$PID_DIR/frontend.pid")
+  fi
+
+  if [ -n "$port_pid" ]; then
+    local mode_label=""
+    if grep -qa -- "--release" "/proc/$port_pid/cmdline" 2>/dev/null; then
+      mode_label=" [RELEASE]"
+    fi
+    success "Frontend: RODANDO$mode_label (PID: $port_pid na porta 3000) → http://localhost:3000"
+    return 0
+  elif is_pid_alive "$pid"; then
+    warn "Frontend: COMPILANDO / INICIANDO (PID: $pid) → http://localhost:3000 (Acompanhe com: ridel frontend logs)"
+    return 0
+  else
+    warn "Frontend: PARADO"
+    return 1
+  fi
+}
+
+frontend_logs() {
+  if [ ! -f "$LOG_DIR/frontend.log" ]; then
+    warn "Arquivo de log não encontrado em $LOG_DIR/frontend.log"
+    return 1
+  fi
+  tail -f "$LOG_DIR/frontend.log"
+}
+
+frontend_attach() {
+  local py_bin="$PROJECT_ROOT/backend/.venv/bin/python"
+  if [ ! -f "$py_bin" ]; then
+    py_bin="python3"
+  fi
+
+  (cd "$PROJECT_ROOT/backend" && "$py_bin" -m ridel attach --pid-dir "$PID_DIR" --log-dir "$LOG_DIR" "$@")
+}
+
+# ------------------------------------------------------------------------------
+# 4. Comandos Globais e Orquestração
+# ------------------------------------------------------------------------------
+
+status_all() {
+  echo ""
+  echo -e "${BOLD}══════════════════════════════════════════════════════════════${NC}"
+  if is_container_env; then
+    echo -e "${BOLD}         STATUS DOS SERVIÇOS — AMBIENTE CONTÊINER DOCKER      ${NC}"
+  else
+    echo -e "${BOLD}              STATUS DOS SERVIÇOS — PLATAFORMA RIDEL          ${NC}"
+  fi
+  echo -e "${BOLD}══════════════════════════════════════════════════════════════${NC}"
+  echo ""
+  db_status || true
+  backend_status || true
+  frontend_status || true
+  if ! is_container_env; then
+    checker_status || true
+    echo ""
+    echo -e "${DIM}Dica: Execute 'ridel logs <serviço>' para acompanhar os logs em tempo real.${NC}"
+  fi
+  echo ""
+}
+
+start_all() {
+  if is_container_env; then
+    info "Ambiente Docker detectado: gerenciando serviços via Supervisord..."
+    if command -v supervisorctl >/dev/null 2>&1; then
+      supervisorctl start all
+    fi
+    echo ""
+    status_all
+    return 0
+  fi
+  echo -e "${BOLD}Iniciando todos os serviços da Plataforma Ridel...${NC}"
+  db_start
+  sleep 1
+  backend_start
+  sleep 1
+  frontend_start
+  echo ""
+  status_all
+}
+
+stop_all() {
+  if is_container_env; then
+    info "Ambiente Docker detectado: parando serviços via Supervisord..."
+    if command -v supervisorctl >/dev/null 2>&1; then
+      supervisorctl stop all
+    fi
+    echo ""
+    success "Todos os serviços foram finalizados no Supervisord."
+    return 0
+  fi
+  echo -e "${BOLD}Encerrando todos os serviços da Plataforma Ridel...${NC}"
+  checker_stop || true
+  frontend_stop
+  backend_stop
+  db_stop
+  echo ""
+  success "Todos os serviços foram finalizados."
+}
+
+restart_all() {
+  if is_container_env; then
+    info "Ambiente Docker detectado: reiniciando serviços via Supervisord..."
+    if command -v supervisorctl >/dev/null 2>&1; then
+      supervisorctl restart all
+    fi
+    echo ""
+    status_all
+    return 0
+  fi
+  echo -e "${BOLD}Reiniciando todos os serviços da Plataforma Ridel...${NC}"
+  stop_all
+  sleep 2
+  start_all
+}
+
+# ------------------------------------------------------------------------------
+# 5. Real-Time Checker e Linter de Tenants
+# ------------------------------------------------------------------------------
+
+checker_run() {
+  local py_bin="$PROJECT_ROOT/backend/.venv/bin/python"
+  if [ ! -f "$py_bin" ]; then
+    error "Python não encontrado em backend/.venv/bin/python."
+    return 1
+  fi
+  (cd "$PROJECT_ROOT/backend" && "$py_bin" -m ridel check "$@")
+}
+
+checker_start() {
+  local pid=""
+  if [ -f "$PID_DIR/checker.pid" ]; then
+    pid=$(cat "$PID_DIR/checker.pid")
+  fi
+  if is_pid_alive "$pid"; then
+    warn "Checker já está em execução em background (PID: $pid)."
+    return 0
+  fi
+
+  local py_bin="$PROJECT_ROOT/backend/.venv/bin/python"
+  if [ ! -f "$py_bin" ]; then
+    error "Python não encontrado em backend/.venv/bin/python."
+    return 1
+  fi
+
+  info "Iniciando Ridel Checker em segundo plano (Watch Mode)..."
+  cd "$PROJECT_ROOT/backend"
+  local cmd=("$py_bin" "-u" "-m" "ridel" "check" "-w")
+  if [ $# -gt 0 ]; then
+    cmd+=("$@")
+  else
+    cmd+=("--all")
+  fi
+
+  setsid "${cmd[@]}" < /dev/null > "$LOG_DIR/checker.log" 2>&1 &
+  local new_pid=$!
+  echo "$new_pid" > "$PID_DIR/checker.pid"
+
+  sleep 1
+  if is_pid_alive "$new_pid"; then
+    success "Checker rodando em background (PID: $new_pid)."
+    info "Logs disponíveis em: .ridel/logs/checker.log (ou execute: ridel check logs)"
+  else
+    error "Falha ao iniciar o Checker. Verifique o log com: ridel check logs"
+    return 1
+  fi
+}
+
+checker_stop() {
+  local pid=""
+  if [ -f "$PID_DIR/checker.pid" ]; then
+    pid=$(cat "$PID_DIR/checker.pid")
+  fi
+  if [ -n "$pid" ]; then
+    kill_process "Checker" "$pid"
+    rm -f "$PID_DIR/checker.pid"
+  else
+    info "Checker não está em execução."
+  fi
+}
+
+checker_status() {
+  local pid=""
+  if [ -f "$PID_DIR/checker.pid" ]; then
+    pid=$(cat "$PID_DIR/checker.pid")
+  fi
+  if is_pid_alive "$pid"; then
+    success "Checker: RODANDO (PID: $pid) [Watch Mode]"
+    return 0
+  else
+    warn "Checker: PARADO"
+    return 1
+  fi
+}
+
+checker_logs() {
+  if [ ! -f "$LOG_DIR/checker.log" ]; then
+    warn "Arquivo de log não encontrado em $LOG_DIR/checker.log"
+    return 1
+  fi
+  tail -f "$LOG_DIR/checker.log"
+}
+
+link_cli() {
+  local target_dir="$HOME/.local/bin"
+  mkdir -p "$target_dir"
+  ln -sf "$PROJECT_ROOT/ridel" "$target_dir/ridel"
+  success "CLI 'ridel' vinculada com sucesso em: $target_dir/ridel"
+  info "Você já pode executar 'ridel <comando>' de qualquer diretório no seu terminal!"
+}
+
+docker_build_image() {
+  local tag="${1:-ridel:local-test}"
+  info "Iniciando compilação de produção do Flutter Universal Player Web..."
+  (cd "$PROJECT_ROOT/frontend" && flutter build web --release)
+  info "Construindo imagem Docker All-in-One: $tag..."
+  docker build -t "$tag" -f "$PROJECT_ROOT/Dockerfile.allinone" "$PROJECT_ROOT"
+  success "Imagem Docker All-in-One construída com sucesso: $tag"
+}
+
+docker_publish() {
+  local version=""
+  local custom_registry=""
+  local skip_tests=0
+  local skip_image=0
+  local skip_git=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --skip-tests)
+        skip_tests=1
+        shift
+        ;;
+      --skip-image)
+        skip_image=1
+        shift
+        ;;
+      --skip-git)
+        skip_git=1
+        shift
+        ;;
+      --registry)
+        shift
+        custom_registry="$1"
+        shift
+        ;;
+      -h|--help)
+        echo -e "${BOLD}Uso:${NC} ridel publish [versao] [--registry <custom>] [--skip-tests] [--skip-image] [--skip-git]"
+        echo ""
+        echo -e "${BOLD}Pipeline de Publicação Dual da Plataforma Ridel:${NC}"
+        echo "  1. Quality Gate: Executa testes unitários essenciais do backend (pytest)"
+        echo "  2. Universal Player: Compila o Flutter Web em modo release otimizado"
+        echo "  3. Imagem Docker: Constrói a imagem All-in-One e envia ao GitHub Container Registry (ghcr.io/p-ridel/p-ridel)"
+        echo "  4. Sincronização Dev: Publica o código-fonte integral no repositório privado p-ridel-dev (remote origin)"
+        echo "  5. Vitrine do Cliente: Publica apenas a documentação limpa (README.md) no repositório público p-ridel (remote client)"
+        echo ""
+        echo "Opções:"
+        echo "  --skip-tests    Pula a execução dos testes do backend"
+        echo "  --skip-image    Pula a compilação do Flutter e o build/push da imagem Docker"
+        echo "  --skip-git      Pula as publicações nos repositórios Git (p-ridel-dev e p-ridel)"
+        echo "  --registry <url> Sobrescreve o registry de containers (padrão: ghcr.io/p-ridel/p-ridel)"
+        echo ""
+        echo "Exemplos:"
+        echo "  ridel publish"
+        echo "  ridel publish 1.0.1"
+        echo "  ridel publish v1.0.1 --skip-tests"
+        echo "  ridel publish --skip-image"
+        return 0
+        ;;
+      *)
+        if [[ -z "$version" && ! "$1" =~ ^-- ]]; then
+          version="$1"
+        else
+          error "Argumento não reconhecido ou versão duplicada: $1"
+          return 1
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  # Versão padrão é 'latest' quando omitida
+  if [[ -z "$version" || "$version" == "latest" ]]; then
+    version="latest"
+  fi
+
+  # Normaliza versão garantindo prefixo 'v' para tags semânticas (ex: 1.0.1 -> v1.0.1)
+  # Se for 'latest', não adiciona 'v'
+  local tag_version="$version"
+  if [[ "$tag_version" != "latest" && "$tag_version" != v* ]]; then
+    tag_version="v$tag_version"
+  fi
+
+  # Resolver Registry dinamicamente a partir do git remote origin
+  local target_registry="$custom_registry"
+  local namespace="p-ridel"
+  if [[ -z "$target_registry" ]]; then
+    if [[ -n "$RIDEL_REGISTRY" ]]; then
+      target_registry="$RIDEL_REGISTRY"
+    else
+      local git_remote
+      git_remote=$(git remote get-url origin 2>/dev/null || true)
+      if [[ -n "$git_remote" ]]; then
+        local repo_slug
+        repo_slug=$(echo "$git_remote" | sed -E 's#(.*github\.com[:/])(.*)\.git#\2#' | tr -d '\r')
+        namespace=$(echo "$repo_slug" | cut -d/ -f1)
+        target_registry="ghcr.io/${namespace}/p-ridel"
+      else
+        target_registry="ghcr.io/p-ridel/p-ridel"
+      fi
+    fi
+  fi
+
+  echo ""
+  echo -e "${BOLD}===================================================================${NC}"
+  echo -e "${BOLD}🚀 Plataforma Ridel — Pipeline Dual de Publicação${NC}"
+  echo -e "${BOLD}===================================================================${NC}"
+  info "Versão de release:   ${BOLD}$tag_version${NC}"
+  info "Target Registry:     ${BOLD}$target_registry${NC}"
+  info "Repositório Dev:     ${BOLD}p-ridel-dev (remote origin)${NC}"
+  info "Repositório Cliente: ${BOLD}p-ridel (remote client)${NC}"
+  echo ""
+
+  # 1. Quality Gate: Testes automatizados do Backend
+  if [[ "$skip_tests" -eq 0 ]]; then
+    info "Executando Quality Gate (testes unitários essenciais do backend)..."
+    local py_bin="$PROJECT_ROOT/backend/.venv/bin/pytest"
+    if [[ ! -f "$py_bin" ]]; then
+      py_bin="pytest"
+    fi
+    if (cd "$PROJECT_ROOT/backend" && "$py_bin" tests/test_docker_bootstrap.py tests/api/test_cli.py tests/api/test_cli_publish.py -q); then
+      success "Quality Gate aprovado com sucesso!"
+    else
+      error "Falha no Quality Gate! A suíte de testes falhou. Publicação abortada."
+      info "Dica: Para forçar a publicação sem testes, utilize a flag: --skip-tests"
+      return 1
+    fi
+  else
+    warn "Quality Gate ignorado via flag --skip-tests."
+  fi
+
+  # 2 & 3. Compilação Flutter Web e Build/Push da Imagem Docker
+  if [[ "$skip_image" -eq 0 ]]; then
+    info "Iniciando compilação de produção do Flutter Universal Player Web..."
+    (cd "$PROJECT_ROOT/frontend" && flutter build web --release)
+    success "Flutter Universal Player Web compilado para produção!"
+
+    local tags_to_build=()
+    local tags_to_push=()
+
+    if [[ "$tag_version" == "latest" ]]; then
+      local full_tag_latest="${target_registry}:latest"
+      tags_to_build+=("-t" "$full_tag_latest")
+      tags_to_push+=("$full_tag_latest")
+    else
+      local full_tag_ver="${target_registry}:${tag_version}"
+      local full_tag_latest="${target_registry}:latest"
+      tags_to_build+=("-t" "$full_tag_ver" "-t" "$full_tag_latest")
+      tags_to_push+=("$full_tag_ver" "$full_tag_latest")
+    fi
+
+    info "Construindo imagem Docker All-in-One..."
+    docker build "${tags_to_build[@]}" -f "$PROJECT_ROOT/Dockerfile.allinone" "$PROJECT_ROOT"
+    success "Imagem Docker construída com sucesso com tags:"
+    for t in "${tags_to_push[@]}"; do
+      info "  • $t"
+    done
+
+    info "Enviando imagens para o registry remoto..."
+    for t in "${tags_to_push[@]}"; do
+      docker push "$t"
+    done
+
+    success "Publicação da imagem concluída no GitHub Container Registry!"
+    for t in "${tags_to_push[@]}"; do
+      info "  • $t"
+    done
+    info "Pacote público oficial: https://github.com/users/${namespace}/packages/container/package/p-ridel"
+  else
+    warn "Compilação e publicação da imagem Docker ignoradas via flag --skip-image."
+  fi
+
+  # 4 & 5. Publicação Git Dual
+  if [[ "$skip_git" -eq 0 ]]; then
+    echo ""
+    info "Iniciando sincronização Git nos repositórios p-ridel-dev e p-ridel..."
+
+    local origin_url client_url
+    origin_url=$(git remote get-url origin 2>/dev/null | tr -d '\r' || true)
+    client_url=$(git remote get-url client 2>/dev/null | tr -d '\r' || true)
+
+    # Normalizar removendo credenciais para comparação segura
+    local clean_origin_url clean_client_url
+    clean_origin_url=$(echo "$origin_url" | sed -E 's#https://[^@]+@#https://#')
+    clean_client_url=$(echo "$client_url" | sed -E 's#https://[^@]+@#https://#')
+
+    if [[ -n "$clean_origin_url" && -n "$clean_client_url" && "$clean_origin_url" == "$clean_client_url" ]]; then
+      error "Os remotes 'origin' e 'client' estão apontando para o mesmo repositório ($clean_origin_url)!"
+      info "O remote 'origin' deve apontar para o repositório privado p-ridel-dev."
+      info "O remote 'client' deve apontar para o repositório público p-ridel."
+      info "Exemplo de correção: git remote set-url origin https://github.com/p-ridel/p-ridel-dev.git"
+      return 1
+    fi
+
+    # 4. Push do projeto completo para p-ridel-dev (remote origin)
+    local current_branch
+    current_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "master")
+    if git remote get-url origin >/dev/null 2>&1; then
+      info "Sincronizando repositório de desenvolvimento (p-ridel-dev via remote origin)..."
+      if git push origin "$current_branch"; then
+        success "Repositório privado p-ridel-dev (origin/$current_branch) atualizado com sucesso!"
+      else
+        error "Falha ao enviar commits para o remote 'origin' (p-ridel-dev)!"
+        return 1
+      fi
+    else
+      warn "Remote 'origin' não encontrado. Pulando sincronização do p-ridel-dev."
+    fi
+
+    # 5. Publicação da documentação pública exclusiva no repositório do cliente (p-ridel via remote client)
+    info "Publicando documentação no repositório público do cliente (p-ridel via remote client)..."
+    if ! git remote get-url client >/dev/null 2>&1; then
+      warn "Remote 'client' não está configurado!"
+      info "Para registrar o remote do cliente e habilitar a documentação pública, execute:"
+      info "  git remote add client https://github.com/p-ridel/p-ridel.git"
+      warn "Push para o repositório público 'p-ridel' ignorado nesta execução."
+    else
+      local readme_path="$PROJECT_ROOT/README.md"
+      if [[ ! -f "$readme_path" ]]; then
+        error "README.md não encontrado na raiz do projeto ($readme_path)!"
+        return 1
+      fi
+
+      info "Criando commit isolado com a documentação pública oficial (README.md e Manual do Desenvolvedor)..."
+      local temp_idx
+      temp_idx=$(mktemp)
+      rm -f "$temp_idx"
+
+      GIT_INDEX_FILE="$temp_idx" git add "$readme_path"
+
+      local install_path="$PROJECT_ROOT/install.sh"
+      if [[ -f "$install_path" ]]; then
+        GIT_INDEX_FILE="$temp_idx" git add "$install_path"
+      fi
+
+      local ridel_bin_path="$PROJECT_ROOT/ridel"
+      if [[ -f "$ridel_bin_path" ]]; then
+        GIT_INDEX_FILE="$temp_idx" git add "$ridel_bin_path"
+      fi
+
+      local manual_path="$PROJECT_ROOT/docs/MANUAL_DO_DESENVOLVEDOR_TENANTS.md"
+      if [[ -f "$manual_path" ]]; then
+        GIT_INDEX_FILE="$temp_idx" git add "$manual_path"
+      fi
+
+      local tree_sha
+      tree_sha=$(GIT_INDEX_FILE="$temp_idx" git write-tree)
+      rm -f "$temp_idx"
+
+      local commit_msg="docs: Atualização da documentação pública oficial da Plataforma Ridel [release $tag_version]"
+      local clean_commit
+      clean_commit=$(git commit-tree "$tree_sha" -m "$commit_msg")
+
+      info "Enviando documentação limpa para o repositório p-ridel..."
+      # Envia para main e master para garantir compatibilidade com qualquer default branch no GitHub
+      local push_ok=0
+      if git push client "${clean_commit}:refs/heads/main" --force 2>/dev/null; then
+        push_ok=1
+      fi
+      if git push client "${clean_commit}:refs/heads/master" --force 2>/dev/null; then
+        push_ok=1
+      fi
+
+      if [[ "$push_ok" -eq 1 ]]; then
+        success "Documentação pública publicada com sucesso em p-ridel (branches: main/master)!"
+      else
+        error "Falha ao enviar a documentação para o remote 'client' (p-ridel)!"
+        return 1
+      fi
+    fi
+  else
+    warn "Sincronização Git ignorada via flag --skip-git."
+  fi
+
+  echo ""
+  success "Processo de publicação dual finalizado com sucesso!"
+  echo ""
+}
+
+
+docker_test() {
+  local tenant=""
+  local keep_image=0
+  local port=8089
+  local custom_port=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        echo ""
+        echo -e "${BOLD}Plataforma Ridel — Validação Automatizada de Imagem All-in-One (dockertest)${NC}"
+        echo -e "${DIM}Uso: ridel dockertest <tenant> [--keep-image] [--port PORT]${NC}"
+        echo ""
+        echo -e "Executa um ciclo completo e automatizado de testes de ponta a ponta na imagem Docker:"
+        echo -e "  1. Compila o Universal Player Flutter Web em modo release;"
+        echo -e "  2. Compila a engine Python com Cython (.so) e gera a imagem local;"
+        echo -e "  3. Inicia um contêiner efêmero com volume persistente temporário (/tmp);"
+        echo -e "  4. Executa bateria prática com 8 etapas de validação funcional;"
+        echo -e "  5. Emite relatório executivo com tempos de resposta;"
+        echo -e "  6. Limpa o contêiner, dados temporários e remove a imagem gerada (a menos que --keep-image)."
+        echo ""
+        echo -e "Opções:"
+        echo -e "  ${CYAN}--keep-image${NC}        Mantém a imagem Docker compilada ao final (não remove via docker rmi)"
+        echo -e "  ${CYAN}--port PORT${NC}         Porta HTTP no host para o contêiner de teste (padrão: 8089)"
+        echo -e "  ${CYAN}-h, --help${NC}          Exibe esta ajuda"
+        echo ""
+        return 0
+        ;;
+      --keep-image)
+        keep_image=1
+        shift
+        ;;
+      --port)
+        shift
+        port="$1"
+        custom_port=1
+        shift
+        ;;
+      *)
+        if [[ -z "$tenant" && ! "$1" =~ ^-- ]]; then
+          tenant="$1"
+        else
+          error "Opção ou argumento desconhecido: $1"
+          echo -e "Uso: ridel dockertest <tenant> [--keep-image] [--port PORT]"
+          return 1
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  if [[ -z "$tenant" ]]; then
+    error "Informe o nome do tenant para executar a validação Docker."
+    echo -e "Uso: ridel dockertest <tenant> [--keep-image] [--port PORT]"
+    return 1
+  fi
+
+  local tenant_path="$PROJECT_ROOT/backend/tenants/$tenant"
+  if [[ ! -d "$tenant_path" ]]; then
+    error "Tenant '$tenant' não encontrado em backend/tenants/!"
+    return 1
+  fi
+
+  # Alocação de porta livre se a padrão estiver em uso
+  if [[ "$custom_port" -eq 0 ]]; then
+    while lsof -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1; do
+      port=$((port + 1))
+      if [[ "$port" -gt 8110 ]]; then
+        error "Não foi possível encontrar uma porta livre no intervalo 8089-8110."
+        return 1
+      fi
+    done
+  fi
+
+  local tag="ridel-dockertest-${tenant}:$(date +%s)"
+  local container_name="ridel_dockertest_${tenant}_$$"
+  local temp_dir
+  temp_dir=$(mktemp -d /tmp/ridel_dockertest_XXXXXX)
+  chmod 777 "$temp_dir"
+
+  # Variáveis globais para o trap de limpeza
+  DOCKERTEST_TAG="$tag"
+  DOCKERTEST_CONTAINER="$container_name"
+  DOCKERTEST_DIR="$temp_dir"
+  DOCKERTEST_KEEP_IMAGE="$keep_image"
+
+  cleanup_dockertest() {
+    info "Executando limpeza de recursos efêmeros..."
+    if [[ -n "$DOCKERTEST_CONTAINER" ]]; then
+      docker rm -f "$DOCKERTEST_CONTAINER" >/dev/null 2>&1 || true
+    fi
+    if [[ -n "$DOCKERTEST_DIR" && -d "$DOCKERTEST_DIR" ]]; then
+      rm -rf "$DOCKERTEST_DIR" >/dev/null 2>&1 || true
+    fi
+    if [[ "${DOCKERTEST_KEEP_IMAGE:-0}" -eq 0 && -n "$DOCKERTEST_TAG" ]]; then
+      docker rmi -f "$DOCKERTEST_TAG" >/dev/null 2>&1 || true
+    fi
+    success "Limpeza concluída com sucesso."
+  }
+  trap cleanup_dockertest EXIT INT TERM
+
+  echo ""
+  echo -e "${BOLD}══════════════════════════════════════════════════════════════${NC}"
+  echo -e "${BOLD}       RIDEL DOCKERTEST — VALIDAÇÃO E2E DE IMAGEM DOCKER      ${NC}"
+  echo -e "${BOLD}══════════════════════════════════════════════════════════════${NC}"
+  echo -e "${DIM}Tenant Alvo:${NC}      $tenant"
+  echo -e "${DIM}Imagem Efêmera:${NC}   $tag"
+  echo -e "${DIM}Contêiner:${NC}        $container_name"
+  echo -e "${DIM}Porta de Teste:${NC}   $port"
+  echo -e "${DIM}Volume /data:${NC}     $temp_dir"
+  echo -e "${DIM}Limpeza Imagem:${NC}   $([ "$keep_image" -eq 1 ] && echo "Manter (--keep-image)" || echo "Remoção Total")"
+  echo -e "${BOLD}══════════════════════════════════════════════════════════════${NC}"
+  echo ""
+
+  local t_start
+  t_start=$(date +%s)
+  local step_start
+  local step_elapsed
+
+  # Array de resultados do relatório
+  declare -a test_names=()
+  declare -a test_status=()
+  declare -a test_times=()
+
+  record_test() {
+    local name="$1"
+    local status="$2"
+    local elapsed="$3"
+    test_names+=("$name")
+    test_status+=("$status")
+    test_times+=("${elapsed}s")
+  }
+
+  # ----------------------------------------------------------------------------
+  # Etapa 1: Build da Imagem com Cython e Flutter Web
+  # ----------------------------------------------------------------------------
+  info "1/8: Construindo imagem All-in-One com Cython hardening ($tag)..."
+  step_start=$(date +%s)
+  if docker build -t "$tag" -f "$PROJECT_ROOT/Dockerfile.allinone" "$PROJECT_ROOT" >/dev/null 2>&1; then
+    step_elapsed=$(( $(date +%s) - step_start ))
+    success "Imagem Docker construída com sucesso (${step_elapsed}s)."
+    record_test "Build All-in-One (Cython + Web)" "PASS" "$step_elapsed"
+  else
+    step_elapsed=$(( $(date +%s) - step_start ))
+    error "Falha na compilação da imagem Docker!"
+    record_test "Build All-in-One (Cython + Web)" "FAIL" "$step_elapsed"
+    return 1
+  fi
+
+  # ----------------------------------------------------------------------------
+  # Etapa 2: Inicialização e Healthcheck
+  # ----------------------------------------------------------------------------
+  info "2/8: Iniciando contêiner isolado na porta $port..."
+  step_start=$(date +%s)
+  local run_err
+  run_err=$(docker run -d \
+    --name "$container_name" \
+    -p "${port}:8000" \
+    -e POSTGRES_PASSWORD="dockertest_password" \
+    -v "${temp_dir}:/data" \
+    "$tag" 2>&1)
+
+  if [[ $? -ne 0 ]]; then
+    step_elapsed=$(( $(date +%s) - step_start ))
+    error "Falha ao iniciar contêiner: $run_err"
+    record_test "Inicialização do Contêiner" "FAIL" "$step_elapsed"
+    return 1
+  fi
+
+  # Aguarda inicialização do Supervisord e serviços (até 30s)
+  local ready=0
+  local attempts=0
+  while [[ $attempts -lt 30 ]]; do
+    if curl -s -f "http://localhost:${port}/health" >/dev/null 2>&1; then
+      local sup_stat
+      sup_stat=$(docker exec "$container_name" supervisorctl status 2>/dev/null || true)
+      if echo "$sup_stat" | grep -q "ridel_backend.*RUNNING" && echo "$sup_stat" | grep -q "postgresql.*RUNNING"; then
+        ready=1
+        break
+      fi
+    fi
+    sleep 1
+    attempts=$((attempts + 1))
+  done
+
+  step_elapsed=$(( $(date +%s) - step_start ))
+  if [[ "$ready" -eq 1 ]]; then
+    success "Contêiner e serviços ativos e saudáveis (${step_elapsed}s)."
+    record_test "Healthcheck (Postgres + Uvicorn)" "PASS" "$step_elapsed"
+  else
+    error "Serviços não atingiram estado RUNNING dentro do tempo limite (${step_elapsed}s)."
+    docker logs --tail 25 "$container_name" || true
+    record_test "Healthcheck (Postgres + Uvicorn)" "FAIL" "$step_elapsed"
+    return 1
+  fi
+
+  # ----------------------------------------------------------------------------
+  # Etapa 3: SPA Routing / Anti-F5 Deep Linking
+  # ----------------------------------------------------------------------------
+  info "3/8: Validando SPA Fallback e recarregamento profundo (Anti-F5 404)..."
+  step_start=$(date +%s)
+  local deep_res
+  deep_res=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:${port}/${tenant}/apps/test_view_f5")
+  step_elapsed=$(( $(date +%s) - step_start ))
+
+  if [[ "$deep_res" == "200" ]]; then
+    success "SPA Fallback validado: rotas profundas retornam index.html 200 OK (${step_elapsed}s)."
+    record_test "SPA Routing / Anti-F5 404" "PASS" "$step_elapsed"
+  else
+    error "Falha no SPA Fallback: rota profunda retornou HTTP $deep_res em vez de 200!"
+    record_test "SPA Routing / Anti-F5 404" "FAIL" "$step_elapsed"
+    return 1
+  fi
+
+  # ----------------------------------------------------------------------------
+  # Etapa 4: Database Seed e Idempotência
+  # ----------------------------------------------------------------------------
+  info "4/8: Testando execução do seed do tenant '$tenant'..."
+  step_start=$(date +%s)
+  local seed_out
+  seed_out=$(docker exec "$container_name" ridel db seed "$tenant" 2>&1)
+  step_elapsed=$(( $(date +%s) - step_start ))
+
+  if echo "$seed_out" | grep -q "concluído\|sucesso"; then
+    success "Database seed executado e validado com sucesso (${step_elapsed}s)."
+    record_test "Database Seed & Idempotência" "PASS" "$step_elapsed"
+  else
+    error "Falha na execução do seed: $seed_out"
+    record_test "Database Seed & Idempotência" "FAIL" "$step_elapsed"
+    return 1
+  fi
+
+  # ----------------------------------------------------------------------------
+  # Etapa 5: Autenticação JWT e Sessão
+  # ----------------------------------------------------------------------------
+  info "5/8: Testando login de administrador e emissão de JWT..."
+  step_start=$(date +%s)
+  local login_json
+  login_json=$(curl -s -X POST "http://localhost:${port}/api/v1/${tenant}/auth/login" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\": \"admin@${tenant}.com\", \"password\": \"admin123\"}")
+
+  local token
+  token=$(echo "$login_json" | jq -r .access_token 2>/dev/null || true)
+  step_elapsed=$(( $(date +%s) - step_start ))
+
+  if [[ -n "$token" && "$token" != "null" ]]; then
+    success "Autenticação realizada com sucesso e token JWT emitido (${step_elapsed}s)."
+    record_test "Autenticação JWT / Login" "PASS" "$step_elapsed"
+  else
+    error "Falha no login: $login_json"
+    record_test "Autenticação JWT / Login" "FAIL" "$step_elapsed"
+    return 1
+  fi
+
+  # ----------------------------------------------------------------------------
+  # Etapa 6: Descoberta de Apps e SDUI Manifest
+  # ----------------------------------------------------------------------------
+  info "6/8: Validando catálogo de Apps e entrega de Manifesto Server-Driven UI..."
+  step_start=$(date +%s)
+  local apps_list
+  apps_list=$(curl -s "http://localhost:${port}/api/v1/${tenant}/apps" -H "Authorization: Bearer $token")
+  local first_app_id
+  first_app_id=$(echo "$apps_list" | jq -r '.[0].app_id' 2>/dev/null || true)
+
+  local manifest_ok=0
+  if [[ -n "$first_app_id" && "$first_app_id" != "null" ]]; then
+    local manifest
+    manifest=$(curl -s "http://localhost:${port}/api/v1/${tenant}/apps/${first_app_id}" -H "Authorization: Bearer $token")
+    if echo "$manifest" | jq -e '.views and .tables' >/dev/null 2>&1; then
+      manifest_ok=1
+    fi
+  fi
+  step_elapsed=$(( $(date +%s) - step_start ))
+
+  if [[ "$manifest_ok" -eq 1 ]]; then
+    success "Catálogo e manifesto SDUI do app '$first_app_id' validados (${step_elapsed}s)."
+    record_test "Descoberta de Apps & SDUI" "PASS" "$step_elapsed"
+  else
+    error "Falha ao validar catálogo e manifesto SDUI: $apps_list"
+    record_test "Descoberta de Apps & SDUI" "FAIL" "$step_elapsed"
+    return 1
+  fi
+
+  # ----------------------------------------------------------------------------
+  # Etapa 7: CRUD de Dados e Busca ILIKE
+  # ----------------------------------------------------------------------------
+  info "7/8: Testando operações CRUD com inserção e busca global (ILIKE)..."
+  step_start=$(date +%s)
+  local random_suffix
+  random_suffix=$(date +%s)
+  local test_name="Dockertest Corp $random_suffix"
+  local crud_insert
+  crud_insert=$(curl -s -X POST "http://localhost:${port}/api/v1/${tenant}/tables/customers/records" \
+    -H "Authorization: Bearer $token" \
+    -H "Content-Type: application/json" \
+    -d "{\"name\": \"$test_name\", \"client_type\": \"PJ\", \"cnpj\": \"11.222.333/0001-44\"}")
+
+  local inserted_id
+  inserted_id=$(echo "$crud_insert" | jq -r .id 2>/dev/null || true)
+
+  local search_found=0
+  if [[ -n "$inserted_id" && "$inserted_id" != "null" ]]; then
+    local search_res
+    search_res=$(curl -s "http://localhost:${port}/api/v1/${tenant}/tables/customers/records?search=${random_suffix}" \
+      -H "Authorization: Bearer $token")
+    if echo "$search_res" | jq -e ".items[] | select(.id == \"$inserted_id\")" >/dev/null 2>&1; then
+      search_found=1
+    fi
+  fi
+  step_elapsed=$(( $(date +%s) - step_start ))
+
+  if [[ "$search_found" -eq 1 ]]; then
+    success "Registro criado e localizado via busca global ILIKE com sucesso (${step_elapsed}s)."
+    record_test "CRUD & Busca Global (ILIKE)" "PASS" "$step_elapsed"
+  else
+    error "Falha no teste de CRUD ou busca global: $crud_insert"
+    record_test "CRUD & Busca Global (ILIKE)" "FAIL" "$step_elapsed"
+    return 1
+  fi
+
+  # ----------------------------------------------------------------------------
+  # Etapa 8: Hot-Reload Declarativo a Quente (WatchFiles + Auto-Reconciliação)
+  # ----------------------------------------------------------------------------
+  info "8/8: Testando Hot-Reload Declarativo com injeção a quente de novo campo..."
+  step_start=$(date +%s)
+  local hot_reload_ok=0
+
+  # Injetar campo declarativo temporário em CustomerTable dentro do container
+  if docker exec "$container_name" sed -i '/class CustomerTable(Table):/a \    dockertest_field = TextField(label="Campo Teste HotReload", required=False)' "/data/tenants/$tenant/tables.py"; then
+    # Aguardar 2.5 segundos para o WatchFiles detectar e recarregar
+    sleep 2.5
+
+    local new_manifest
+    new_manifest=$(curl -s "http://localhost:${port}/api/v1/${tenant}/apps/${first_app_id}" -H "Authorization: Bearer $token")
+    if echo "$new_manifest" | grep -q "dockertest_field"; then
+      hot_reload_ok=1
+    fi
+  fi
+  step_elapsed=$(( $(date +%s) - step_start ))
+
+  if [[ "$hot_reload_ok" -eq 1 ]]; then
+    success "Hot-Reload a quente validado: novo campo detectado e exposto no manifesto (${step_elapsed}s)."
+    record_test "Hot-Reload Declarativo (WatchFiles)" "PASS" "$step_elapsed"
+  else
+    error "Falha ao validar recarregamento a quente do campo declarativo!"
+    record_test "Hot-Reload Declarativo (WatchFiles)" "FAIL" "$step_elapsed"
+    return 1
+  fi
+
+  # ----------------------------------------------------------------------------
+  # Relatório Executivo Final
+  # ----------------------------------------------------------------------------
+  local total_elapsed=$(( $(date +%s) - t_start ))
+  echo ""
+  echo -e "${BOLD}══════════════════════════════════════════════════════════════════════════════${NC}"
+  echo -e "${BOLD}                    RELATÓRIO DE VALIDAÇÃO DOCKERTEST                         ${NC}"
+  echo -e "${BOLD}══════════════════════════════════════════════════════════════════════════════${NC}"
+  printf "${BOLD}%-40s %-12s %-10s${NC}\n" "BATERIA DE TESTES" "RESULTADO" "DURAÇÃO"
+  echo "──────────────────────────────────────────────────────────────────────────────"
+  for i in "${!test_names[@]}"; do
+    local st="${test_status[$i]}"
+    local st_fmt=""
+    if [[ "$st" == "PASS" ]]; then
+      st_fmt="${GREEN}✔ PASSOU${NC}  "
+    else
+      st_fmt="${RED}✖ FALHOU${NC}  "
+    fi
+    printf "%-40s %-20b %-10s\n" "${test_names[$i]}" "$st_fmt" "${test_times[$i]}"
+  done
+  echo "──────────────────────────────────────────────────────────────────────────────"
+  echo -e "${BOLD}Status Consolidado:${NC} ${GREEN}100% APROVADO (8 de 8 testes passaram)${NC}"
+  echo -e "${BOLD}Tempo Total:${NC}        ${total_elapsed}s"
+  echo -e "${BOLD}══════════════════════════════════════════════════════════════════════════════${NC}"
+  echo ""
+
+  cleanup_dockertest
+  trap - EXIT INT TERM
+  return 0
+}
+
+# ------------------------------------------------------------------------------
+# 8. Atualização e Rollback de Imagem Docker All-in-One (ridel update / rollback)
+# ------------------------------------------------------------------------------
+
+docker_update() {
+  local version=""
+  local container_name="ridel"
+  local custom_port=""
+  local skip_healthcheck=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        echo ""
+        echo -e "${BOLD}Plataforma Ridel — Atualização de Imagem Docker (ridel update)${NC}"
+        echo -e "${DIM}Uso: ridel update [versao] [opções]${NC}"
+        echo ""
+        echo -e "Atualiza o contêiner oficial da Plataforma Ridel (ghcr.io/p-ridel/p-ridel) preservando dados locais:"
+        echo -e "  1. Inspeciona o contêiner ativo e salva snapshot local para rollback;"
+        echo -e "  2. Baixa a nova imagem do GitHub Container Registry (GHCR);"
+        echo -e "  3. Recria o contêiner preservando 100% dos volumes montados (/data), portas e variáveis;"
+        echo -e "  4. Executa healthcheck confirmando a integridade da nova versão."
+        echo ""
+        echo -e "Opções:"
+        echo -e "  ${CYAN}--name <nome>${NC}          Nome do contêiner Docker a atualizar (padrão: ridel)"
+        echo -e "  ${CYAN}--port <porta>${NC}         Porta HTTP no host para testar o healthcheck"
+        echo -e "  ${CYAN}--skip-healthcheck${NC}    Pula a verificação de saúde pós-atualização"
+        echo -e "  ${CYAN}-h, --help${NC}             Exibe este menu de ajuda"
+        echo ""
+        return 0
+        ;;
+      --name)
+        shift
+        container_name="$1"
+        shift
+        ;;
+      --port)
+        shift
+        custom_port="$1"
+        shift
+        ;;
+      --skip-healthcheck)
+        skip_healthcheck=1
+        shift
+        ;;
+      *)
+        if [[ -z "$version" && ! "$1" =~ ^-- ]]; then
+          version="$1"
+        else
+          warn "Opção desconhecida para update: $1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  if is_container_env; then
+    warn "O comando 'ridel update' gerencia o ciclo de vida do contêiner Docker e deve ser executado no host."
+    info "Execute no terminal da sua máquina: ridel update"
+    return 1
+  fi
+
+  if ! command -v docker >/dev/null 2>&1; then
+    error "Docker não encontrado no sistema host."
+    return 1
+  fi
+
+  if ! docker inspect "$container_name" >/dev/null 2>&1; then
+    error "Contêiner '$container_name' não encontrado ou inexistente."
+    info "Verifique se o contêiner está rodando com 'docker ps' ou especifique outro nome via '--name'."
+    return 1
+  fi
+
+  info "Inspecionando contêiner '$container_name'..."
+  local current_image_id
+  current_image_id=$(docker inspect "$container_name" --format '{{.Image}}' 2>/dev/null || true)
+
+  if [[ -z "$current_image_id" || "$current_image_id" == "null" ]]; then
+    error "Não foi possível identificar a imagem atual do contêiner '$container_name'."
+    return 1
+  fi
+
+  local rollback_tag="ghcr.io/p-ridel/p-ridel:rollback_backup"
+  info "Criando snapshot local de rollback ($rollback_tag)..."
+  docker tag "$current_image_id" "$rollback_tag" >/dev/null 2>&1 || true
+
+  local ridel_runtime_dir=".ridel"
+  mkdir -p "$ridel_runtime_dir"
+  echo "$current_image_id" > "$ridel_runtime_dir/rollback_image_id"
+
+  local target_tag="latest"
+  if [[ -n "$version" ]]; then
+    target_tag="$version"
+  fi
+  local target_image="ghcr.io/p-ridel/p-ridel:${target_tag}"
+
+  info "Baixando nova imagem: $target_image..."
+  if ! docker pull "$target_image"; then
+    error "Falha ao baixar imagem $target_image do GHCR. O contêiner atual não foi modificado."
+    return 1
+  fi
+
+  # Extrair portas
+  local port_args=()
+  local host_http_port="8000"
+  local raw_ports
+  raw_ports=$(docker inspect "$container_name" --format '{{range $port, $bindings := .HostConfig.PortBindings}}{{range $bindings}}{{.HostPort}}:{{$port}}
+{{end}}{{end}}' 2>/dev/null || true)
+  if [[ -n "$raw_ports" ]]; then
+    while IFS= read -r p_bind; do
+      if [[ -n "$p_bind" ]]; then
+        port_args+=("-p" "$p_bind")
+        if [[ "$p_bind" == *":8000"* ]]; then
+          host_http_port="${p_bind%%:*}"
+        fi
+      fi
+    done <<< "$raw_ports"
+  fi
+
+  if [[ -n "$custom_port" ]]; then
+    host_http_port="$custom_port"
+  fi
+
+  if [[ ${#port_args[@]} -eq 0 ]]; then
+    port_args=("-p" "${host_http_port}:8000" "-p" "5432:5432")
+  fi
+
+  # Extrair mounts / volumes
+  local mount_args=()
+  local raw_mounts
+  raw_mounts=$(docker inspect "$container_name" --format '{{range .Mounts}}{{.Source}}:{{.Destination}}
+{{end}}' 2>/dev/null || true)
+  if [[ -n "$raw_mounts" ]]; then
+    while IFS= read -r mnt; do
+      if [[ -n "$mnt" ]]; then
+        mount_args+=("-v" "$mnt")
+      fi
+    done <<< "$raw_mounts"
+  fi
+
+  # Extrair variáveis de ambiente
+  local env_args=()
+  local raw_envs
+  raw_envs=$(docker inspect "$container_name" --format '{{range .Config.Env}}{{.}}
+{{end}}' 2>/dev/null || true)
+  if [[ -n "$raw_envs" ]]; then
+    while IFS= read -r env_item; do
+      if [[ "$env_item" =~ ^(POSTGRES_|SECRET_KEY|TENANTS_DIR|RIDEL_) ]]; then
+        env_args+=("-e" "$env_item")
+      fi
+    done <<< "$raw_envs"
+  fi
+
+  info "Parando contêiner atual '$container_name'..."
+  docker stop "$container_name" >/dev/null 2>&1 || true
+  docker rm "$container_name" >/dev/null 2>&1 || true
+
+  local run_cmd=(docker run -d --name "$container_name" --restart unless-stopped)
+  run_cmd+=("${port_args[@]}")
+  run_cmd+=("${mount_args[@]}")
+  run_cmd+=("${env_args[@]}")
+  run_cmd+=("$target_image")
+
+  info "Iniciando contêiner atualizado..."
+  if ! "${run_cmd[@]}"; then
+    error "Falha ao iniciar contêiner com nova imagem!"
+    warn "Restaurando versão anterior automaticamente..."
+    docker_rollback --name "$container_name"
+    return 1
+  fi
+
+  if [[ $skip_healthcheck -eq 0 ]]; then
+    info "Aguardando healthcheck em http://localhost:${host_http_port}/health (até 30s)..."
+    local healthy=0
+    local attempts=0
+    while [[ $attempts -lt 30 ]]; do
+      if curl -s -f "http://localhost:${host_http_port}/health" >/dev/null 2>&1; then
+        healthy=1
+        break
+      fi
+      sleep 1
+      attempts=$((attempts + 1))
+    done
+
+    if [[ $healthy -eq 1 ]]; then
+      success "Contêiner '$container_name' atualizado para '$target_image' com sucesso!"
+      echo ""
+      echo -e "${DIM}💡 Dica: Se precisar reverter para a versão anterior, execute:${NC}"
+      echo -e "${CYAN}   ridel rollback --name $container_name${NC}"
+      echo ""
+    else
+      warn "O contêiner subiu, mas não respondeu ao healthcheck na porta ${host_http_port} dentro de 30s."
+      warn "Se houver falha, você pode reverter imediatamente com: ridel rollback --name $container_name"
+    fi
+  else
+    success "Contêiner '$container_name' atualizado com sucesso (healthcheck ignorado via flag)."
+  fi
+  if ! is_container_env; then
+    echo ""
+    cli_self_update || true
+  fi
+  return 0
+}
+
+docker_rollback() {
+  local container_name="ridel"
+  local custom_port=""
+  local skip_healthcheck=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help)
+        echo ""
+        echo -e "${BOLD}Plataforma Ridel — Reversão de Imagem Docker (ridel rollback)${NC}"
+        echo -e "${DIM}Uso: ridel rollback [opções]${NC}"
+        echo ""
+        echo -e "Reverte o contêiner para o snapshot local da versão anterior sem necessidade de download:"
+        echo -e "  1. Localiza a imagem de backup (ghcr.io/p-ridel/p-ridel:rollback_backup);"
+        echo -e "  2. Reinicia o contêiner preservando 100% dos volumes montados (/data), portas e variáveis;"
+        echo -e "  3. Valida a restauração via healthcheck."
+        echo ""
+        echo -e "Opções:"
+        echo -e "  ${CYAN}--name <nome>${NC}          Nome do contêiner Docker a reverter (padrão: ridel)"
+        echo -e "  ${CYAN}--port <porta>${NC}         Porta HTTP no host para testar o healthcheck"
+        echo -e "  ${CYAN}--skip-healthcheck${NC}    Pula a verificação de saúde pós-reversão"
+        echo -e "  ${CYAN}-h, --help${NC}             Exibe este menu de ajuda"
+        echo ""
+        return 0
+        ;;
+      --name)
+        shift
+        container_name="$1"
+        shift
+        ;;
+      --port)
+        shift
+        custom_port="$1"
+        shift
+        ;;
+      --skip-healthcheck)
+        skip_healthcheck=1
+        shift
+        ;;
+      *)
+        warn "Opção desconhecida para rollback: $1"
+        shift
+        ;;
+    esac
+  done
+
+  if is_container_env; then
+    warn "O comando 'ridel rollback' gerencia o ciclo de vida do contêiner Docker e deve ser executado no host."
+    info "Execute no terminal da sua máquina: ridel rollback"
+    return 1
+  fi
+
+  if ! command -v docker >/dev/null 2>&1; then
+    error "Docker não encontrado no sistema host."
+    return 1
+  fi
+
+  local rollback_image="ghcr.io/p-ridel/p-ridel:rollback_backup"
+  local rollback_id=""
+  if [[ -f ".ridel/rollback_image_id" ]]; then
+    rollback_id=$(cat ".ridel/rollback_image_id" 2>/dev/null || true)
+  fi
+
+  local has_backup=0
+  if docker inspect "$rollback_image" >/dev/null 2>&1; then
+    has_backup=1
+  elif [[ -n "$rollback_id" ]] && docker inspect "$rollback_id" >/dev/null 2>&1; then
+    has_backup=1
+    rollback_image="$rollback_id"
+  fi
+
+  if [[ $has_backup -eq 0 ]]; then
+    error "Nenhum snapshot de backup encontrado para rollback!"
+    info "A imagem '$rollback_image' ou registro em '.ridel/rollback_image_id' não foi localizado."
+    return 1
+  fi
+
+  if ! docker inspect "$container_name" >/dev/null 2>&1; then
+    error "Contêiner '$container_name' não encontrado ou inexistente."
+    return 1
+  fi
+
+  info "Inspecionando contêiner '$container_name' para rollback..."
+
+  # Portas
+  local port_args=()
+  local host_http_port="8000"
+  local raw_ports
+  raw_ports=$(docker inspect "$container_name" --format '{{range $port, $bindings := .HostConfig.PortBindings}}{{range $bindings}}{{.HostPort}}:{{$port}}
+{{end}}{{end}}' 2>/dev/null || true)
+  if [[ -n "$raw_ports" ]]; then
+    while IFS= read -r p_bind; do
+      if [[ -n "$p_bind" ]]; then
+        port_args+=("-p" "$p_bind")
+        if [[ "$p_bind" == *":8000"* ]]; then
+          host_http_port="${p_bind%%:*}"
+        fi
+      fi
+    done <<< "$raw_ports"
+  fi
+
+  if [[ -n "$custom_port" ]]; then
+    host_http_port="$custom_port"
+  fi
+
+  if [[ ${#port_args[@]} -eq 0 ]]; then
+    port_args=("-p" "${host_http_port}:8000" "-p" "5432:5432")
+  fi
+
+  # Mounts / Volumes
+  local mount_args=()
+  local raw_mounts
+  raw_mounts=$(docker inspect "$container_name" --format '{{range .Mounts}}{{.Source}}:{{.Destination}}
+{{end}}' 2>/dev/null || true)
+  if [[ -n "$raw_mounts" ]]; then
+    while IFS= read -r mnt; do
+      if [[ -n "$mnt" ]]; then
+        mount_args+=("-v" "$mnt")
+      fi
+    done <<< "$raw_mounts"
+  fi
+
+  # Variáveis de ambiente
+  local env_args=()
+  local raw_envs
+  raw_envs=$(docker inspect "$container_name" --format '{{range .Config.Env}}{{.}}
+{{end}}' 2>/dev/null || true)
+  if [[ -n "$raw_envs" ]]; then
+    while IFS= read -r env_item; do
+      if [[ "$env_item" =~ ^(POSTGRES_|SECRET_KEY|TENANTS_DIR|RIDEL_) ]]; then
+        env_args+=("-e" "$env_item")
+      fi
+    done <<< "$raw_envs"
+  fi
+
+  info "Parando contêiner atual '$container_name'..."
+  docker stop "$container_name" >/dev/null 2>&1 || true
+  docker rm "$container_name" >/dev/null 2>&1 || true
+
+  local run_cmd=(docker run -d --name "$container_name" --restart unless-stopped)
+  run_cmd+=("${port_args[@]}")
+  run_cmd+=("${mount_args[@]}")
+  run_cmd+=("${env_args[@]}")
+  run_cmd+=("$rollback_image")
+
+  info "Recriando contêiner com imagem de rollback ($rollback_image)..."
+  if ! "${run_cmd[@]}"; then
+    error "Falha ao recriar contêiner a partir da imagem de rollback!"
+    return 1
+  fi
+
+  if [[ $skip_healthcheck -eq 0 ]]; then
+    info "Validando saúde em http://localhost:${host_http_port}/health (até 30s)..."
+    local healthy=0
+    local attempts=0
+    while [[ $attempts -lt 30 ]]; do
+      if curl -s -f "http://localhost:${host_http_port}/health" >/dev/null 2>&1; then
+        healthy=1
+        break
+      fi
+      sleep 1
+      attempts=$((attempts + 1))
+    done
+
+    if [[ $healthy -eq 1 ]]; then
+      success "Rollback concluído! Contêiner '$container_name' restaurado com sucesso para a versão anterior."
+    else
+      warn "O contêiner foi recriado, mas não respondeu ao healthcheck na porta ${host_http_port} dentro de 30s."
+    fi
+  else
+    success "Rollback concluído (healthcheck ignorado via flag)."
+  fi
+  return 0
+}
+
+help_menu() {
+  if is_standalone_host; then
+    echo ""
+    echo -e "${BOLD}Plataforma Ridel — CLI do Desenvolvedor (Modo Host)${NC}"
+    echo -e "${DIM}Uso: ridel <comando> [argumentos]${NC}"
+    echo ""
+    echo -e "${BOLD}Gestão da Plataforma (Docker):${NC}"
+    echo -e "  ${GREEN}ridel start${NC}                Inicia o contêiner oficial da Plataforma Ridel"
+    echo -e "  ${GREEN}ridel stop${NC}                 Para o contêiner da Plataforma Ridel"
+    echo -e "  ${GREEN}ridel restart${NC}              Reinicia o contêiner"
+    echo -e "  ${GREEN}ridel status${NC}               Exibe o status do contêiner e saúde da API/Universal Player"
+    echo -e "  ${GREEN}ridel logs${NC}                 Acompanha os logs em tempo real do contêiner"
+    echo -e "  ${GREEN}ridel update [versao]${NC}      Atualiza a imagem Docker mantendo 100% dos dados (alias: ridel att)"
+    echo -e "  ${GREEN}ridel rollback${NC}             Restaura a versão anterior da imagem Docker instantaneamente"
+    echo ""
+    echo -e "${BOLD}Desenvolvimento de Tenants:${NC}"
+    echo -e "  ${CYAN}ridel tenant create <nome>${NC} Cria a estrutura declarativa de um novo tenant"
+    echo -e "  ${CYAN}ridel check [tenant]${NC}       Valida a integridade estática do tenant (tabelas, views, roles)"
+    echo -e "  ${CYAN}ridel seed [tenant]${NC}        Popula o banco com os dados declarativos do tenant"
+    echo ""
+    echo -e "${BOLD}Utilitários:${NC}"
+    echo -e "  ${CYAN}ridel cli update${NC}           Atualiza o próprio script 'ridel' para a última versão do GitHub"
+    echo -e "  ${CYAN}ridel help${NC}                 Exibe este menu de ajuda"
+    echo ""
+    return 0
+  fi
+
+  echo ""
+  echo -e "${BOLD}Plataforma Ridel — CLI Oficial de Desenvolvimento${NC}"
+  echo -e "${DIM}Uso: ridel <serviço> <ação> [opções] | ridel <comando-global>${NC}"
+  echo ""
+  echo -e "${BOLD}Comandos por Serviço:${NC}"
+  echo -e "  ${CYAN}ridel db start${NC}             Sobe o container do PostgreSQL via Docker Compose"
+  echo -e "  ${CYAN}ridel db stop${NC}              Para o container do PostgreSQL"
+  echo -e "  ${CYAN}ridel db restart${NC}           Reinicia o PostgreSQL"
+  echo -e "  ${CYAN}ridel db status${NC}            Exibe o status do container"
+  echo -e "  ${CYAN}ridel db logs [tenant] [-d N]${NC} Acompanha os logs do banco (padrão: 100 linhas; -d N dias, --tail N, --all)"
+  echo -e "  ${CYAN}ridel db seed${NC}              Popula o banco com os dados de demonstração (tenant demo - dev local)"
+  echo ""
+  echo -e "  ${CYAN}ridel backend start [-f]${NC}      Inicia o FastAPI (background por padrão; -f para foreground)"
+  echo -e "  ${CYAN}ridel backend stop${NC}            Para o FastAPI de forma limpa (porta 8000)"
+  echo -e "  ${CYAN}ridel backend restart [-f]${NC}   Reinicia o backend"
+  echo -e "  ${CYAN}ridel backend status${NC}          Verifica integridade e status na porta 8000"
+  echo -e "  ${CYAN}ridel backend logs${NC}            Exibe o log do backend em tempo real"
+  echo ""
+  echo -e "  ${CYAN}ridel frontend start [-f]${NC}     Inicia o Flutter Web (background por padrão; -f para foreground)"
+  echo -e "  ${CYAN}ridel frontend stop${NC}           Para o Flutter Web (porta 3000)"
+  echo -e "  ${CYAN}ridel frontend reload${NC}         Dispara Hot Reload ('r') no Flutter Web ativo em background"
+  echo -e "  ${CYAN}ridel frontend hot-restart${NC}    Dispara Hot Restart ('R') no Flutter Web ativo em background"
+  echo -e "  ${CYAN}ridel frontend attach${NC}         Reanexa a sessão interativa do Flutter Web em tempo real"
+  echo -e "  ${CYAN}ridel frontend restart [-f]${NC}  Reinicia o frontend (processo completo)"
+  echo -e "  ${CYAN}ridel frontend release [-f]${NC}  Termina a instância atual e inicia o Flutter Web em modo RELEASE"
+  echo -e "  ${CYAN}ridel frontend status${NC}         Verifica integridade e status na porta 3000"
+  echo -e "  ${CYAN}ridel frontend logs${NC}           Exibe o log do frontend em tempo real"
+  echo ""
+  echo -e "  ${CYAN}ridel check [tenant] [-w]${NC}     Executa verificação estática do tenant (ou todos; -w para watch)"
+  echo -e "  ${CYAN}ridel check start [tenant]${NC}    Inicia o checker em background com watch mode"
+  echo -e "  ${CYAN}ridel check stop${NC}              Encerra o checker em background"
+  echo -e "  ${CYAN}ridel check status${NC}            Verifica o status do checker em background"
+  echo -e "  ${CYAN}ridel check logs${NC}              Acompanha os logs do checker em tempo real"
+  echo ""
+  echo -e "${BOLD}Comandos Globais / Atalhos:${NC}"
+  echo -e "  ${GREEN}ridel status${NC}               Exibe o painel consolidado com a saúde de todos os serviços"
+  echo -e "  ${GREEN}ridel start${NC}                Sobe db, backend e frontend sequencialmente"
+  echo -e "  ${GREEN}ridel stop${NC}                 Para todos os serviços em execução"
+  echo -e "  ${GREEN}ridel restart${NC}              Reinicia toda a stack de desenvolvimento"
+  echo -e "  ${GREEN}ridel reload${NC}                 Atalho para 'ridel frontend reload': dispara Hot Reload no Universal Player"
+  echo -e "  ${GREEN}ridel hot-restart${NC}            Atalho para 'ridel frontend hot-restart': dispara Hot Restart no Universal Player"
+  echo -e "  ${GREEN}ridel attach${NC}                 Atalho para 'ridel frontend attach': reanexa a sessão interativa do Flutter"
+  echo -e "  ${GREEN}ridel release [-f]${NC}         Atalho para 'ridel frontend release': encerra o frontend ativo e sobe o Flutter Web em modo RELEASE"
+  echo -e "  ${GREEN}ridel publish [versao]${NC}     Publicação dual: código em p-ridel-dev e imagem/docs no repositório público p-ridel"
+  echo -e "  ${GREEN}ridel build-image [tag]${NC}    Compila o Flutter Web e gera a imagem Docker All-in-One localmente"
+  echo -e "  ${GREEN}ridel dockertest <tenant>${NC}   Validação automatizada E2E da imagem Docker (build, boot, testes e cleanup)"
+  echo -e "  ${GREEN}ridel update [versao]${NC}      Atualiza o contêiner oficial (GHCR) preservando dados locais"
+  echo -e "  ${GREEN}ridel rollback${NC}             Reverte o contêiner para o snapshot anterior da versão estável"
+  echo -e "  ${GREEN}ridel link${NC}                 Cria o symlink em ~/.local/bin/ridel para acesso global no shell"
+  echo -e "  ${GREEN}ridel help${NC}                 Exibe este menu de ajuda"
+  echo ""
+}
+
+# ------------------------------------------------------------------------------
+# Roteamento de Argumentos
+# ------------------------------------------------------------------------------
+
+case "$1" in
+  db)
+    shift
+    case "$1" in
+      start)   db_start ;;
+      stop)    db_stop ;;
+      restart) db_restart ;;
+      status)  db_status ;;
+      logs)    shift; db_logs "$@" ;;
+      seed)    shift; db_seed "$@" ;;
+      *)       warn "Ação desconhecida para 'db'. Use: start, stop, restart, status, logs, seed"; exit 1 ;;
+    esac
+    ;;
+
+  backend)
+    shift
+    case "$1" in
+      start)   shift; backend_start "$@" ;;
+      stop)    backend_stop ;;
+      restart) shift; backend_restart "$@" ;;
+      status)  backend_status ;;
+      logs)    backend_logs ;;
+      *)       warn "Ação desconhecida para 'backend'. Use: start, stop, restart, status, logs"; exit 1 ;;
+    esac
+    ;;
+
+  frontend)
+    shift
+    case "$1" in
+      start)       shift; frontend_start "$@" ;;
+      stop)        frontend_stop ;;
+      restart)     shift; frontend_restart "$@" ;;
+      reload)      frontend_reload ;;
+      hot-restart) frontend_hot_restart ;;
+      attach)      shift; frontend_attach "$@" ;;
+      release) shift; frontend_release "$@" ;;
+      status)      frontend_status ;;
+      logs)        frontend_logs ;;
+      *)           warn "Ação desconhecida para 'frontend'. Use: start, stop, restart, reload, hot-restart, attach, release, status, logs"; exit 1 ;;
+    esac
+    ;;
+
+  check)
+    shift
+    if is_standalone_host; then
+      standalone_proxy check "$@"
+    else
+      case "$1" in
+        start)  shift; checker_start "$@" ;;
+        stop)   checker_stop ;;
+        status) checker_status ;;
+        logs)   checker_logs ;;
+        *)      checker_run "$@" ;;
+      esac
+    fi
+    ;;
+
+  tenant)
+    shift
+    if is_standalone_host; then
+      standalone_proxy tenant "$@"
+    else
+      case "$1" in
+        create) shift; tenant_create "$@" ;;
+        *)      warn "Ação desconhecida para 'tenant'. Use: create <nome>"; exit 1 ;;
+      esac
+    fi
+    ;;
+
+  status)
+    if is_standalone_host; then
+      standalone_status
+    else
+      status_all
+    fi
+    ;;
+
+  start)
+    if is_standalone_host; then
+      standalone_start "$@"
+    else
+      start_all
+    fi
+    ;;
+
+  stop)
+    if is_standalone_host; then
+      standalone_stop "$@"
+    else
+      stop_all
+    fi
+    ;;
+
+  restart)
+    if is_standalone_host; then
+      standalone_restart "$@"
+    else
+      restart_all
+    fi
+    ;;
+
+  reload)
+    frontend_reload
+    ;;
+
+  hot-restart)
+    frontend_hot_restart
+    ;;
+
+  attach)
+    shift
+    frontend_attach "$@"
+    ;;
+
+  release)
+    shift; frontend_release "$@"
+    ;;
+
+  seed)
+    shift || true
+    if is_standalone_host; then
+      standalone_proxy seed "$@"
+    else
+      db_seed "$@"
+    fi
+    ;;
+
+  logs)
+    shift
+    if is_standalone_host; then
+      standalone_logs "$@"
+    else
+      case "$1" in
+        db)       shift; db_logs "$@" ;;
+        backend)  backend_logs ;;
+        frontend) frontend_logs ;;
+        checker)  checker_logs ;;
+        *)        warn "Especifique o serviço para logs: db [tenant], backend, frontend ou checker"; exit 1 ;;
+      esac
+    fi
+    ;;
+
+  link)
+    link_cli
+    ;;
+
+  publish)
+    if is_standalone_host; then
+      error "O comando 'ridel publish' é restrito aos mantenedores da Plataforma Ridel no repositório de engenharia."
+      exit 1
+    fi
+    shift
+    docker_publish "$@"
+    ;;
+
+  build-image)
+    if is_standalone_host; then
+      error "O comando 'ridel build-image' é restrito aos mantenedores da Plataforma Ridel no repositório de engenharia."
+      exit 1
+    fi
+    shift
+    docker_build_image "$@"
+    ;;
+
+  dockertest)
+    if is_standalone_host; then
+      error "O comando 'ridel dockertest' é restrito aos mantenedores da Plataforma Ridel no repositório de engenharia."
+      exit 1
+    fi
+    shift
+    docker_test "$@"
+    ;;
+
+  update|att)
+    shift
+    docker_update "$@"
+    ;;
+
+  rollback)
+    shift
+    docker_rollback "$@"
+    ;;
+
+  cli)
+    shift
+    case "$1" in
+      update) shift; cli_self_update "$@" ;;
+      *)      warn "Ação desconhecida para 'cli'. Use: update"; exit 1 ;;
+    esac
+    ;;
+
+  help|--help|-h|"")
+    help_menu
+    ;;
+
+  *)
+    error "Comando não reconhecido: $1"
+    help_menu
+    exit 1
+    ;;
+esac
